@@ -1,0 +1,5 @@
+company,name,title,profile_url,source,confidence,current
+Example Startup,Asha Patel,CTO,https://provider.example/profiles/asha,Licensed provider,0.98,true
+Example Startup,Rohan Shah,Co-founder,https://provider.example/profiles/rohan,Licensed provider,0.96,true
+Example MNC,Mira Kumar,VP Engineering,https://provider.example/profiles/mira,Licensed provider,0.95,true
+
