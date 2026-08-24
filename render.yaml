@@ -15,3 +15,7 @@ services:
         sync: false
       - key: ALLOWED_TELEGRAM_USER_IDS
         sync: false
+      - key: BRAVE_SEARCH_API_KEY
+        sync: false
+      - key: PROSPEO_API_KEY
+        sync: false

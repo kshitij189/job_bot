@@ -2,11 +2,17 @@
 
 Telegram webhook bot that returns up to five current, senior contacts for each requested company. It does **not** scrape LinkedIn or automate a LinkedIn account. Supply records only from a licensed/authorized people-data provider or your own permitted data.
 
+When `BRAVE_SEARCH_API_KEY` is set, the bot instead queries Brave's public web-search API for publicly indexed profile URLs. It does not log into, scrape, or fetch data from LinkedIn; results are search candidates, not independently verified employment records.
+
+When `PROSPEO_API_KEY` is set, it takes priority and the bot queries Prospeo's structured People Search API for the requested company and senior role titles. The free Prospeo plan has limited monthly credits and rate limits; each successful search consumes a credit.
+
 ## Setup
 
 1. Revoke the Telegram token previously pasted into chat in **@BotFather**, then create a new one.
 2. Copy `.env.example` to `.env` and fill in the new token, a random webhook secret, and your public HTTPS base URL. Keep `.env` private.
 3. Copy `candidates.example.csv` to `candidates.csv` and replace the examples with authorized data. Required columns are `company,name,title,profile_url`; optional ones are `source,confidence,current`.
+   Alternatively, set `BRAVE_SEARCH_API_KEY` to use Brave Search instead of the CSV. Create the key in the Brave Search API dashboard and set it as a Render environment variable, never in Git or chat.
+   Or set `PROSPEO_API_KEY` to use Prospeo's structured person search. It is preferred over Brave Search when both are present.
 4. Create a virtual environment and install dependencies:
 
    ```powershell

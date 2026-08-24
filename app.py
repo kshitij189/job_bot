@@ -29,6 +29,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 CSV_PATH = Path(os.getenv("CANDIDATES_CSV", "candidates.csv"))
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "")
+PROSPEO_API_KEY = os.getenv("PROSPEO_API_KEY", "")
 ALLOWED_USERS = {
     value.strip() for value in os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").split(",") if value.strip()
 }
@@ -115,6 +117,100 @@ def find_profiles(company: str, requested_type: str | None) -> tuple[str, list[C
     return company_type, selected
 
 
+async def find_profiles_from_brave(company: str, requested_type: str | None) -> tuple[str, list[Candidate]]:
+    """Find public, search-indexed profile URLs without accessing LinkedIn directly."""
+    company_type = classify_company(company, requested_type)
+    terms = STARTUP_TERMS if company_type == "startup" else MNC_TERMS
+    role_query = " OR ".join(f'"{term}"' for term in terms)
+    query = f'site:linkedin.com/in/ "{company}" ({role_query})'
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_SEARCH_API_KEY},
+                params={"q": query, "count": 20, "safesearch": "moderate"},
+            )
+            response.raise_for_status()
+        results = response.json().get("web", {}).get("results", [])
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Brave Search request failed: %s", error)
+        return company_type, []
+
+    candidates: list[Candidate] = []
+    seen_urls: set[str] = set()
+    for result in results:
+        url = str(result.get("url", "")).strip()
+        if "linkedin.com/in/" not in url.casefold() or url in seen_urls:
+            continue
+        title = str(result.get("title", "Public profile result")).strip()
+        # Search results do not provide a trustworthy structured job title, so keep the
+        # result title intact rather than pretending it has been independently verified.
+        name = title.split(" - ", 1)[0].strip() or "Profile"
+        candidates.append(Candidate(company, name, title, url, "Brave public-web search", 0.5, True))
+        seen_urls.add(url)
+        if len(candidates) == 5:
+            break
+    return company_type, candidates
+
+
+async def find_profiles_from_prospeo(company: str, requested_type: str | None) -> tuple[str, list[Candidate]]:
+    """Search Prospeo's authorized API for current senior people at a company."""
+    company_type = classify_company(company, requested_type)
+    terms = list(STARTUP_TERMS if company_type == "startup" else MNC_TERMS)
+    payload = {
+        "page": 1,
+        "filters": {
+            "company": {"names": {"include": [company]}},
+            "person_job_title": {"include": terms, "match_mode": "CONTAINS"},
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.prospeo.io/search-person",
+                headers={"X-KEY": PROSPEO_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            )
+            response.raise_for_status()
+        body = response.json()
+        if body.get("error"):
+            logger.warning("Prospeo search failed: %s", body.get("error_code", "unknown error"))
+            return company_type, []
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Prospeo request failed: %s", error)
+        return company_type, []
+
+    candidates: list[Candidate] = []
+    for result in body.get("results", []):
+        person = result.get("person") or {}
+        profile_url = str(person.get("linkedin_url") or "").strip()
+        name = str(person.get("full_name") or "").strip()
+        title = str(person.get("current_job_title") or "").strip()
+        if not profile_url or not name or not title:
+            continue
+        candidates.append(Candidate(company, name, title, profile_url, "Prospeo API", 0.9, True))
+
+    ranked = sorted(((score(candidate, company, company_type), candidate) for candidate in candidates), key=lambda item: item[0], reverse=True)
+    selected: list[Candidate] = []
+    seen: set[str] = set()
+    for candidate_score, candidate in ranked:
+        if candidate_score < 0 or normalise(candidate.name) in seen:
+            continue
+        selected.append(candidate)
+        seen.add(normalise(candidate.name))
+        if len(selected) == 5:
+            break
+    return company_type, selected
+
+
+async def get_profiles(company: str, requested_type: str | None) -> tuple[str, list[Candidate]]:
+    if PROSPEO_API_KEY:
+        return await find_profiles_from_prospeo(company, requested_type)
+    if BRAVE_SEARCH_API_KEY:
+        return await find_profiles_from_brave(company, requested_type)
+    return find_profiles(company, requested_type)
+
+
 def parse_request(text: str) -> list[tuple[str, str | None]]:
     text = re.sub(r"^/(find|start)(?:@\w+)?\s*", "", text, flags=re.I).strip()
     if not text:
@@ -182,7 +278,10 @@ async def telegram_webhook(
     if not requests:
         await telegram_send(chat_id, "Use: /find Company A, Company B | mnc\nTypes: startup or mnc.")
         return {"ok": True}
-    replies = [render(company, *(find_profiles(company, kind))) for company, kind in requests]
+    replies = []
+    for company, kind in requests:
+        company_type, candidates = await get_profiles(company, kind)
+        replies.append(render(company, company_type, candidates))
     await telegram_send(chat_id, "\n\n".join(replies)[:4000])
     return {"ok": True}
 
