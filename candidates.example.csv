@@ -1,5 +1,4 @@
-company,name,title,profile_url,source,confidence,current
-Example Startup,Asha Patel,CTO,https://provider.example/profiles/asha,Licensed provider,0.98,true
-Example Startup,Rohan Shah,Co-founder,https://provider.example/profiles/rohan,Licensed provider,0.96,true
-Example MNC,Mira Kumar,VP Engineering,https://provider.example/profiles/mira,Licensed provider,0.95,true
-
+company,name,title,profile_url,source,confidence,current,work_email,personal_email
+Example Startup,Asha Patel,CTO,https://www.linkedin.com/in/asha-patel,Licensed provider,0.98,true,asha.patel@example-startup.com,
+Example Startup,Rohan Shah,Co-founder,https://www.linkedin.com/in/rohan-shah,Licensed provider,0.96,true,rohan.shah@example-startup.com,rohan@example.net
+Example MNC,Mira Kumar,VP Engineering,https://www.linkedin.com/in/mira-kumar,Licensed provider,0.95,true,mira.kumar@example-mnc.com,

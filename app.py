@@ -53,6 +53,8 @@ class Candidate:
     source: str
     confidence: float
     current: bool
+    work_email: str = ""
+    personal_email: str = ""
 
 
 def normalise(text: str) -> str:
@@ -80,6 +82,8 @@ def load_candidates() -> list[Candidate]:
                     source=row.get("source", "Authorized provider").strip(),
                     confidence=float(row.get("confidence", 0)),
                     current=normalise(row.get("current", "true")) in {"true", "yes", "1"},
+                    work_email=row.get("work_email", "").strip(),
+                    personal_email=row.get("personal_email", "").strip(),
                 ))
             except (KeyError, ValueError, AttributeError):
                 logger.warning("Skipping invalid candidate row")
@@ -115,6 +119,30 @@ def find_profiles(company: str, requested_type: str | None) -> tuple[str, list[C
         if len(selected) == 5:
             break
     return company_type, selected
+
+
+def merge_authorized_contact_fields(candidates: list[Candidate]) -> list[Candidate]:
+    """Add optional contact fields from the permitted local data source.
+
+    This lets an organization keep consented personal-email data in its own CSV
+    while using a search provider for fresh profile and work-email information.
+    """
+    by_identity = {
+        (normalise(record.company), normalise(record.name)): record
+        for record in load_candidates()
+    }
+    merged: list[Candidate] = []
+    for candidate in candidates:
+        permitted = by_identity.get((normalise(candidate.company), normalise(candidate.name)))
+        if permitted is None:
+            merged.append(candidate)
+            continue
+        merged.append(Candidate(
+            candidate.company, candidate.name, candidate.title, candidate.profile_url,
+            candidate.source, candidate.confidence, candidate.current,
+            candidate.work_email or permitted.work_email, permitted.personal_email,
+        ))
+    return merged
 
 
 async def find_profiles_from_brave(company: str, requested_type: str | None) -> tuple[str, list[Candidate]]:
@@ -200,14 +228,48 @@ async def find_profiles_from_prospeo(company: str, requested_type: str | None) -
         seen.add(normalise(candidate.name))
         if len(selected) == 5:
             break
-    return company_type, selected
+    return company_type, await enrich_work_emails_from_prospeo(selected)
+
+
+async def enrich_work_emails_from_prospeo(candidates: list[Candidate]) -> list[Candidate]:
+    """Reveal verified work emails for the selected Prospeo people.
+
+    Search responses expose only masked email metadata. Prospeo's authorized
+    Enrich Person endpoint reveals a verified work email and may charge one
+    provider credit per successful match; it does not provide personal emails.
+    """
+    if not candidates:
+        return candidates
+
+    enriched: list[Candidate] = []
+    async with httpx.AsyncClient(timeout=20) as client:
+        for candidate in candidates:
+            try:
+                response = await client.post(
+                    "https://api.prospeo.io/enrich-person",
+                    headers={"X-KEY": PROSPEO_API_KEY, "Content-Type": "application/json"},
+                    json={"only_verified_email": True, "data": {"linkedin_url": candidate.profile_url}},
+                )
+                response.raise_for_status()
+                person = response.json().get("person") or {}
+                email = (person.get("email") or {}).get("email") or ""
+                enriched.append(Candidate(
+                    candidate.company, candidate.name, candidate.title, candidate.profile_url,
+                    candidate.source, candidate.confidence, candidate.current, str(email).strip(),
+                ))
+            except (httpx.HTTPError, ValueError, TypeError) as error:
+                logger.warning("Prospeo email enrichment failed for %s: %s", candidate.name, error)
+                enriched.append(candidate)
+    return enriched
 
 
 async def get_profiles(company: str, requested_type: str | None) -> tuple[str, list[Candidate]]:
     if PROSPEO_API_KEY:
-        return await find_profiles_from_prospeo(company, requested_type)
+        company_type, candidates = await find_profiles_from_prospeo(company, requested_type)
+        return company_type, merge_authorized_contact_fields(candidates)
     if BRAVE_SEARCH_API_KEY:
-        return await find_profiles_from_brave(company, requested_type)
+        company_type, candidates = await find_profiles_from_brave(company, requested_type)
+        return company_type, merge_authorized_contact_fields(candidates)
     return find_profiles(company, requested_type)
 
 
@@ -235,7 +297,11 @@ def render(company: str, company_type: str, candidates: list[Candidate]) -> str:
         return heading + "\nNo verified matches in the authorized data source."
     lines = [heading]
     for index, candidate in enumerate(candidates, 1):
-        lines.extend((f"{index}. {candidate.name} — {candidate.title}", candidate.profile_url))
+        lines.extend((f"{index}. {candidate.name} — {candidate.title}", f"LinkedIn: {candidate.profile_url}"))
+        if candidate.work_email:
+            lines.append(f"Work email: {candidate.work_email}")
+        if candidate.personal_email:
+            lines.append(f"Personal email: {candidate.personal_email}")
     if len(candidates) < 5:
         lines.append(f"Only {len(candidates)} verified match(es) were available.")
     return "\n".join(lines)
