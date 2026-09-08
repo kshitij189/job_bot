@@ -7,6 +7,7 @@ when you have credentials and permission to use that data.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -55,6 +56,7 @@ class Candidate:
     current: bool
     work_email: str = ""
     personal_email: str = ""
+    provider_person_id: str = ""
 
 
 def normalise(text: str) -> str:
@@ -141,8 +143,31 @@ def merge_authorized_contact_fields(candidates: list[Candidate]) -> list[Candida
             candidate.company, candidate.name, candidate.title, candidate.profile_url,
             candidate.source, candidate.confidence, candidate.current,
             candidate.work_email or permitted.work_email, permitted.personal_email,
+            candidate.provider_person_id,
         ))
     return merged
+
+
+async def post_prospeo(
+    client: httpx.AsyncClient, url: str, payload: dict[str, object]
+) -> httpx.Response:
+    """POST to Prospeo with bounded retries for temporary throttling/outages."""
+    for attempt in range(3):
+        response = await client.post(
+            url,
+            headers={"X-KEY": PROSPEO_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        if response.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
+            return response
+
+        try:
+            delay = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            delay = 2**attempt
+        await asyncio.sleep(min(max(delay, 1), 30))
+
+    raise RuntimeError("unreachable")
 
 
 async def find_profiles_from_brave(company: str, requested_type: str | None) -> tuple[str, list[Candidate]]:
@@ -194,16 +219,12 @@ async def find_profiles_from_prospeo(company: str, requested_type: str | None) -
     }
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                "https://api.prospeo.io/search-person",
-                headers={"X-KEY": PROSPEO_API_KEY, "Content-Type": "application/json"},
-                json=payload,
-            )
-            response.raise_for_status()
+            response = await post_prospeo(client, "https://api.prospeo.io/search-person", payload)
         body = response.json()
         if body.get("error"):
-            logger.warning("Prospeo search failed: %s", body.get("error_code", "unknown error"))
+            logger.info("Prospeo search returned %s: %s", body.get("error_code", "unknown error"), body.get("filter_error", ""))
             return company_type, []
+        response.raise_for_status()
     except (httpx.HTTPError, ValueError) as error:
         logger.warning("Prospeo request failed: %s", error)
         return company_type, []
@@ -216,7 +237,10 @@ async def find_profiles_from_prospeo(company: str, requested_type: str | None) -
         title = str(person.get("current_job_title") or "").strip()
         if not profile_url or not name or not title:
             continue
-        candidates.append(Candidate(company, name, title, profile_url, "Prospeo API", 0.9, True))
+        candidates.append(Candidate(
+            company, name, title, profile_url, "Prospeo API", 0.9, True,
+            provider_person_id=str(person.get("person_id") or "").strip(),
+        ))
 
     ranked = sorted(((score(candidate, company, company_type), candidate) for candidate in candidates), key=lambda item: item[0], reverse=True)
     selected: list[Candidate] = []
@@ -245,17 +269,26 @@ async def enrich_work_emails_from_prospeo(candidates: list[Candidate]) -> list[C
     async with httpx.AsyncClient(timeout=20) as client:
         for candidate in candidates:
             try:
-                response = await client.post(
+                person_data = {"person_id": candidate.provider_person_id} if candidate.provider_person_id else {
+                    "linkedin_url": candidate.profile_url
+                }
+                response = await post_prospeo(
+                    client,
                     "https://api.prospeo.io/enrich-person",
-                    headers={"X-KEY": PROSPEO_API_KEY, "Content-Type": "application/json"},
-                    json={"only_verified_email": True, "data": {"linkedin_url": candidate.profile_url}},
+                    {"only_verified_email": True, "data": person_data},
                 )
+                body = response.json()
+                if body.get("error"):
+                    logger.info("Prospeo enrichment unavailable for %s: %s", candidate.name, body.get("error_code", "unknown error"))
+                    enriched.append(candidate)
+                    continue
                 response.raise_for_status()
-                person = response.json().get("person") or {}
+                person = body.get("person") or {}
                 email = (person.get("email") or {}).get("email") or ""
                 enriched.append(Candidate(
                     candidate.company, candidate.name, candidate.title, candidate.profile_url,
                     candidate.source, candidate.confidence, candidate.current, str(email).strip(),
+                    candidate.personal_email, candidate.provider_person_id,
                 ))
             except (httpx.HTTPError, ValueError, TypeError) as error:
                 logger.warning("Prospeo email enrichment failed for %s: %s", candidate.name, error)
